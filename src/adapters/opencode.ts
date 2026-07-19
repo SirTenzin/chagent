@@ -21,11 +21,17 @@
 
 import { Database } from "bun:sqlite";
 import { text } from "../text.ts";
-import type {
-  IRMessage,
-  IRPart,
-  IRSession,
-  IRToolResultPart,
+import {
+  newId,
+  type IRChildSession,
+  type IRMessage,
+  type IRPart,
+  type IRSession,
+  type IRToolResultPart,
+  type IRUsage,
+  type ReadIssue,
+  type ReadResult,
+  type SessionRef,
 } from "../ir.ts";
 import { randomBase62 } from "../util.ts";
 
@@ -49,14 +55,23 @@ class AscendingId {
   private lastMs = 0;
   private counter = 0;
   next(prefix: string, ms: number): string {
-    if (ms === this.lastMs) this.counter++;
-    else {
+    // ids must be monotonic in emission order: source timestamps can run
+    // backwards a few ms (observed in CC records), and opencode orders by id
+    if (ms <= this.lastMs) {
+      ms = this.lastMs;
+      this.counter++;
+    } else {
       this.lastMs = ms;
       this.counter = 1;
     }
     const shifted = Math.max(ms - MSG_TIME_OFFSET, 1);
     const time = (BigInt(shifted) << 12n) | BigInt(this.counter);
     return `${prefix}_${time.toString(16).padStart(12, "0")}${randomBase62(14)}`;
+  }
+  /** the clamped ms of the last id — used for row time columns so stored
+   * ordering (time_created, id) stays self-consistent */
+  get ms(): number {
+    return this.lastMs;
   }
 }
 
@@ -78,14 +93,7 @@ export async function writeOpenCodeSession(
   }
   const db = new Database(dbPath, { readwrite: true });
   try {
-    const tables = db
-      .query(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('project', 'session', 'message', 'part')",
-      )
-      .all();
-    if (tables.length !== 4) {
-      throw new Error(text.opencodeTablesMissing(dbPath));
-    }
+    assertTables(db, dbPath);
     db.exec("BEGIN");
     const projectId = await resolveProject(db, ir.cwd);
     const id = writeSession(db, ir, projectId, null);
@@ -105,6 +113,17 @@ export async function writeOpenCodeSession(
     throw err;
   } finally {
     db.close();
+  }
+}
+
+function assertTables(db: Database, dbPath: string): void {
+  const tables = db
+    .query(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('project', 'session', 'message', 'part')",
+    )
+    .all();
+  if (tables.length !== 4) {
+    throw new Error(text.opencodeTablesMissing(dbPath));
   }
 }
 
@@ -238,16 +257,10 @@ function writeSession(
           summary: true,
         }),
       };
-      insertMessage.run(msgId, sesId, ts, ts, JSON.stringify(data));
+      insertMessage.run(msgId, sesId, ids.ms, ids.ms, JSON.stringify(data));
       for (const part of parts) {
-        insertPart.run(
-          ids.next("prt", ts),
-          msgId,
-          sesId,
-          ts,
-          ts,
-          JSON.stringify(part),
-        );
+        const partId = ids.next("prt", ts);
+        insertPart.run(partId, msgId, sesId, ids.ms, ids.ms, JSON.stringify(part));
       }
       prevMsgId = msgId;
     } else {
@@ -263,16 +276,10 @@ function writeSession(
         agent: "build",
         model: { providerID: lastModel.providerID, modelID: lastModel.modelID },
       };
-      insertMessage.run(msgId, sesId, ts, ts, JSON.stringify(data));
+      insertMessage.run(msgId, sesId, ids.ms, ids.ms, JSON.stringify(data));
       for (const part of parts) {
-        insertPart.run(
-          ids.next("prt", ts),
-          msgId,
-          sesId,
-          ts,
-          ts,
-          JSON.stringify(part),
-        );
+        const partId = ids.next("prt", ts);
+        insertPart.run(partId, msgId, sesId, ids.ms, ids.ms, JSON.stringify(part));
       }
       prevMsgId = msgId;
     }
@@ -281,12 +288,13 @@ function writeSession(
   // unpaired results (fork gaps): a tool part on the last assistant message
   for (const [callId, result] of results) {
     if (consumed.has(result) || lastAssistantId === null) continue;
+    const partId = ids.next("prt", updated);
     insertPart.run(
-      ids.next("prt", updated),
+      partId,
       lastAssistantId,
       sesId,
-      updated,
-      updated,
+      ids.ms,
+      ids.ms,
       JSON.stringify(toolPart(callId, result.name ?? "unknown", undefined, result, undefined)),
     );
   }
@@ -479,4 +487,384 @@ function userParts(message: IRMessage, ts: number, msgId: string): unknown[] {
     }
   }
   return parts;
+}
+
+// ---------------------------------------------------------------------------
+// Reader
+// ---------------------------------------------------------------------------
+
+type Row = Record<string, unknown>;
+
+export async function listOpenCodeSessions(
+  dbPath: string,
+): Promise<SessionRef[]> {
+  if (!(await Bun.file(dbPath).exists())) return [];
+  const db = new Database(dbPath, { readonly: true });
+  try {
+    assertTables(db, dbPath);
+    const rows = db
+      .query<{ id: string; directory: string; time_updated: number }, []>(
+        `SELECT id, directory, time_updated FROM session
+         WHERE parent_id IS NULL ORDER BY time_updated DESC`,
+      )
+      .all();
+    return rows.map((r) => ({
+      harness: "opencode",
+      id: r.id,
+      locator: `${dbPath}::${r.id}`,
+      cwd: r.directory,
+      updatedAt: r.time_updated,
+    }));
+  } finally {
+    db.close();
+  }
+}
+
+export async function readOpenCodeSession(
+  locator: string,
+): Promise<ReadResult> {
+  const sep = locator.lastIndexOf("::");
+  if (sep === -1) {
+    throw new Error(`bad opencode locator (expected <dbPath>::<ses_id>): ${locator}`);
+  }
+  const dbPath = locator.slice(0, sep);
+  const rootId = locator.slice(sep + 2);
+  const db = new Database(dbPath, { readonly: true });
+  try {
+    assertTables(db, dbPath);
+    const issues: ReadIssue[] = [];
+    const session = readTree(db, dbPath, rootId, issues);
+    return { session, issues };
+  } finally {
+    db.close();
+  }
+}
+
+function readTree(
+  db: Database,
+  dbPath: string,
+  sesId: string,
+  issues: ReadIssue[],
+): IRSession {
+  const row = db
+    .query<Row, [string]>("SELECT * FROM session WHERE id = ?")
+    .get(sesId);
+  if (row === null) throw new Error(`no opencode session ${sesId} in ${dbPath}`);
+
+  const session: IRSession = {
+    id: newId(),
+    source: {
+      harness: "opencode",
+      id: sesId,
+      locator: `${dbPath}::${sesId}`,
+      ...(typeof row.version === "string" && { versions: [row.version] }),
+    },
+    cwd: typeof row.directory === "string" ? row.directory : "",
+    ...(typeof row.title === "string" && { title: row.title }),
+    ...(typeof row.time_created === "number" && { createdAt: row.time_created }),
+    ...(typeof row.time_updated === "number" && { updatedAt: row.time_updated }),
+    messages: [],
+    children: [],
+    extensions: [],
+  };
+
+  // session.metadata: our chagent sidecar restores verbatim; anything else
+  // is opencode bookkeeping, kept as a session extension
+  if (typeof row.metadata === "string" && row.metadata !== "") {
+    try {
+      const meta = JSON.parse(row.metadata) as Row;
+      const chagent = meta.chagent as Row | undefined;
+      if (chagent !== undefined && Array.isArray(chagent.extensions)) {
+        session.extensions.push(...(chagent.extensions as IRSession["extensions"]));
+        if (chagent.source !== undefined) {
+          session.extensions.push({
+            harness: "opencode",
+            extType: "chagent:origin",
+            position: 0,
+            payload: chagent.source,
+          });
+        }
+        delete meta.chagent;
+      }
+      if (Object.keys(meta).length > 0) {
+        session.extensions.push({
+          harness: "opencode",
+          extType: "session-metadata",
+          position: 0,
+          payload: meta,
+        });
+      }
+    } catch (err) {
+      issues.push({ line: 0, kind: "bad-session-metadata", detail: String(err) });
+    }
+  }
+
+  // parts grouped per message, both ordered by ascending id
+  const partsByMsg = new Map<string, Row[]>();
+  for (const p of db
+    .query<{ message_id: string; data: string }, [string]>(
+      "SELECT message_id, data FROM part WHERE session_id = ? ORDER BY id",
+    )
+    .all(sesId)) {
+    let data: Row;
+    try {
+      data = JSON.parse(p.data);
+    } catch (err) {
+      issues.push({ line: 0, kind: "bad-part-json", detail: String(err) });
+      continue;
+    }
+    const bucket = partsByMsg.get(p.message_id) ?? [];
+    bucket.push(data);
+    partsByMsg.set(p.message_id, bucket);
+  }
+
+  /** task-tool callId -> child session id, for child linkage */
+  const childCallByOcId = new Map<string, string>();
+
+  for (const m of db
+    .query<{ id: string; time_created: number; data: string }, [string]>(
+      "SELECT id, time_created, data FROM message WHERE session_id = ? ORDER BY id",
+    )
+    .all(sesId)) {
+    let data: Row;
+    try {
+      data = JSON.parse(m.data);
+    } catch (err) {
+      issues.push({ line: 0, kind: "bad-message-json", detail: String(err) });
+      continue;
+    }
+    const message = toMessage(
+      data,
+      partsByMsg.get(m.id) ?? [],
+      m.time_created,
+      childCallByOcId,
+      issues,
+    );
+    if (message !== undefined) session.messages.push(message);
+  }
+
+  for (const child of db
+    .query<{ id: string }, [string]>(
+      "SELECT id FROM session WHERE parent_id = ? ORDER BY time_created",
+    )
+    .all(sesId)) {
+    const ref: IRChildSession = {
+      session: readTree(db, dbPath, child.id, issues),
+    };
+    const linked = childCallByOcId.get(child.id);
+    if (linked !== undefined) ref.linkedCallId = linked;
+    session.children.push(ref);
+  }
+  return session;
+}
+
+const MESSAGE_MAPPED_KEYS = new Set([
+  "role",
+  "time",
+  "tokens",
+  "cost",
+  "modelID",
+  "providerID",
+  "model",
+]);
+
+function toMessage(
+  data: Row,
+  rawParts: Row[],
+  fallbackTs: number,
+  childCallByOcId: Map<string, string>,
+  issues: ReadIssue[],
+): IRMessage | undefined {
+  const role = data.role;
+  if (role !== "user" && role !== "assistant") {
+    issues.push({ line: 0, kind: "unknown-role", detail: String(role) });
+    return undefined;
+  }
+
+  const parts: IRPart[] = [];
+  for (const raw of rawParts) {
+    parts.push(...toParts(raw, childCallByOcId, issues));
+  }
+
+  const meta: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(data)) {
+    if (!MESSAGE_MAPPED_KEYS.has(k)) meta[k] = v;
+  }
+
+  const time = data.time as Row | undefined;
+  const message: IRMessage = {
+    id: newId(),
+    role,
+    parts,
+    timestamp:
+      typeof time?.created === "number" ? time.created : fallbackTs,
+    ...(Object.keys(meta).length > 0 && { meta }),
+  };
+
+  const model = modelOf(data);
+  if (model !== undefined) message.model = model;
+  const usage = usageOf(data);
+  if (usage !== undefined) message.usage = usage;
+  return message;
+}
+
+/** both field generations: top-level modelID/providerID, or nested model{} */
+function modelOf(data: Row): IRMessage["model"] {
+  if (typeof data.modelID === "string") {
+    return {
+      ...(typeof data.providerID === "string" && { provider: data.providerID }),
+      id: data.modelID,
+    };
+  }
+  const model = data.model as Row | undefined;
+  if (model === undefined) return undefined;
+  const id = typeof model.modelID === "string" ? model.modelID
+    : typeof model.id === "string" ? model.id : undefined;
+  if (id === undefined) return undefined;
+  return {
+    ...(typeof model.providerID === "string" && { provider: model.providerID }),
+    id,
+  };
+}
+
+function usageOf(data: Row): IRUsage | undefined {
+  const tokens = data.tokens as Row | undefined;
+  if (tokens === undefined && typeof data.cost !== "number") return undefined;
+  const cache = tokens?.cache as Row | undefined;
+  const num = (v: unknown) => (typeof v === "number" ? v : undefined);
+  const usage: IRUsage = {
+    inputTokens: num(tokens?.input),
+    outputTokens: num(tokens?.output),
+    reasoningTokens: num(tokens?.reasoning),
+    cacheReadTokens: num(cache?.read),
+    cacheWriteTokens: num(cache?.write),
+    costUsd: num(data.cost),
+  };
+  return Object.values(usage).some((v) => v !== undefined) ? usage : undefined;
+}
+
+function toParts(
+  raw: Row,
+  childCallByOcId: Map<string, string>,
+  issues: ReadIssue[],
+): IRPart[] {
+  switch (raw.type) {
+    case "text": {
+      const meta: Record<string, unknown> = {};
+      if (raw.synthetic === true) meta.synthetic = true;
+      return [
+        {
+          type: "text",
+          text: String(raw.text ?? ""),
+          ...(Object.keys(meta).length > 0 && { meta }),
+        },
+      ];
+    }
+    case "reasoning": {
+      const md = (raw.metadata ?? {}) as Row;
+      const provider = ["anthropic", "bedrock", "openai"].find(
+        (ns) => md[ns] !== undefined,
+      );
+      const nsValue = provider !== undefined ? (md[provider] as Row) : undefined;
+      return [
+        {
+          type: "thinking",
+          text: String(raw.text ?? ""),
+          ...(provider !== undefined &&
+            nsValue !== undefined && {
+              signature: {
+                provider,
+                // our writer wraps a bare signature as {signature}; native
+                // shapes (openai {itemId, reasoningEncryptedContent}) pass
+                // through whole
+                data:
+                  Object.keys(nsValue).length === 1 &&
+                  nsValue.signature !== undefined
+                    ? nsValue.signature
+                    : nsValue,
+              },
+            }),
+        },
+      ];
+    }
+    case "tool": {
+      const state = (raw.state ?? {}) as Row;
+      const callId = String(raw.callID ?? "");
+      const name = String(raw.tool ?? "");
+      const stateMeta = state.metadata as Row | undefined;
+      if (typeof stateMeta?.sessionId === "string") {
+        childCallByOcId.set(stateMeta.sessionId, callId);
+      }
+      const status = String(state.status ?? "completed");
+      const result: IRToolResultPart = {
+        type: "toolResult",
+        callId,
+        name,
+        text: String(
+          status === "error" ? state.error ?? "" : state.output ?? "",
+        ),
+        isError: status === "error",
+        ...(stateMeta !== undefined && { structured: stateMeta }),
+        meta: {
+          status,
+          ...(state.title !== undefined && { title: state.title }),
+          ...(raw.metadata !== undefined && { partMetadata: raw.metadata }),
+          ...((status === "running" || status === "pending") && {
+            incomplete: true,
+          }),
+        },
+      };
+      return [
+        { type: "toolCall", callId, name, input: state.input ?? {} },
+        result,
+      ];
+    }
+    case "compaction":
+      return [
+        {
+          type: "compaction",
+          ...(typeof raw.auto === "boolean" && { auto: raw.auto }),
+          meta: { opencode: raw },
+        },
+      ];
+    case "file": {
+      const url = String(raw.url ?? "");
+      if (url.startsWith("data:")) {
+        const comma = url.indexOf(",");
+        return [
+          {
+            type: "image",
+            mediaType: String(raw.mime ?? "application/octet-stream"),
+            data: comma === -1 ? "" : url.slice(comma + 1),
+            meta: { opencode: { ...raw, url: undefined } },
+          },
+        ];
+      }
+      const source = raw.source as Row | undefined;
+      return [
+        {
+          type: "attachment",
+          path:
+            typeof source?.path === "string"
+              ? source.path
+              : typeof raw.filename === "string"
+                ? raw.filename
+                : undefined,
+          mime: typeof raw.mime === "string" ? raw.mime : undefined,
+          meta: { opencode: raw },
+        },
+      ];
+    }
+    default:
+      // step-start/step-finish framing, agent mentions, patches, subtasks,
+      // future part types: positional extensions, never dropped
+      return [
+        {
+          type: "extension",
+          harness: "opencode",
+          extType: `part:${String(raw.type)}`,
+          payload: raw,
+        },
+      ];
+  }
 }

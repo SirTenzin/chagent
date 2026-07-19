@@ -1,26 +1,33 @@
 /**
- * Pi adapter — writer.
+ * Pi adapter — reader + writer.
  *
- * Target format: `<piHome>/sessions/--<encoded-cwd>--/<iso-ts>_<uuidv7>.jsonl`,
+ * Format: `<piHome>/sessions/--<encoded-cwd>--/<iso-ts>_<uuidv7>.jsonl`,
  * a linear JSONL chain: a `session` header, then entries (`message`,
  * `model_change`, `compaction`, …) linked by `id`/`parentId`. Tool results are
  * standalone `message` entries with role `toolResult`; subagent runs are
  * sidecar files under `<session-basename>/<8hex>/run-N/session.jsonl`.
  *
- * The writer never touches the real `~/.pi` unless the caller passes it as
- * `piHome` — tests point it at a scratch directory.
+ * Neither direction touches the real `~/.pi` unless the caller passes it as
+ * `piHome`/locator — tests point at scratch directories and read the real
+ * store read-only.
  */
 
-import { join } from "node:path";
-import { mkdir } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { mkdir, readdir, stat } from "node:fs/promises";
 import { uuidv7 } from "../util.ts";
 import { text } from "../text.ts";
-import type {
-  IRChildSession,
-  IRMessage,
-  IRSession,
-  IRToolCallPart,
-  IRToolResultPart,
+import {
+  newId,
+  type IRChildSession,
+  type IRImagePart,
+  type IRMessage,
+  type IRPart,
+  type IRSession,
+  type IRToolCallPart,
+  type IRToolResultPart,
+  type ReadIssue,
+  type ReadResult,
+  type SessionRef,
 } from "../ir.ts";
 
 const PI_SESSION_VERSION = 3;
@@ -412,4 +419,428 @@ function entryId(): string {
 
 function isoForFilename(ts: number): string {
   return new Date(ts).toISOString().replace(/[:.]/g, "-");
+}
+
+// ---------------------------------------------------------------------------
+// reader
+// ---------------------------------------------------------------------------
+
+type Rec = Record<string, unknown>;
+
+export async function listPiSessions(piHome: string): Promise<SessionRef[]> {
+  const root = join(piHome, "sessions");
+  const refs: SessionRef[] = [];
+  const dirs = await readdir(root).catch(() => [] as string[]);
+  for (const dir of dirs) {
+    const files = await readdir(join(root, dir)).catch(() => [] as string[]);
+    for (const file of files) {
+      const match = /_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/.exec(
+        file,
+      );
+      if (match === null) continue;
+      const locator = join(root, dir, file);
+      const ref: SessionRef = { harness: "pi", id: match[1]!, locator };
+      const st = await stat(locator).catch(() => null);
+      if (st !== null) ref.updatedAt = st.mtimeMs;
+      try {
+        const head = await Bun.file(locator).slice(0, 8192).text();
+        const header = JSON.parse(head.split("\n", 1)[0]!);
+        if (typeof header.cwd === "string") ref.cwd = header.cwd;
+      } catch {
+        // unreadable/partial header — the ref still lists, read reports it
+      }
+      refs.push(ref);
+    }
+  }
+  return refs;
+}
+
+export async function readPiSession(locator: string): Promise<ReadResult> {
+  const issues: ReadIssue[] = [];
+  const session = await parsePiSession(locator, issues);
+  return { session, issues };
+}
+
+async function parsePiSession(
+  path: string,
+  issues: ReadIssue[],
+): Promise<IRSession> {
+  const session: IRSession = {
+    id: newId(),
+    source: { harness: "pi", id: "", locator: path },
+    cwd: "",
+    messages: [],
+    children: [],
+    extensions: [],
+  };
+
+  const lines = (await Bun.file(path).text()).split("\n");
+  let currentModel: { provider?: string; id?: string } | undefined;
+  let expectedParent: string | null = null;
+  /** whether the previous entry was a toolResult (they batch into one
+   * user-role IR message, mirroring how Claude Code groups them) */
+  let inResultBatch = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    if (line.trim() === "") continue;
+    let entry: Rec;
+    try {
+      entry = JSON.parse(line);
+    } catch (err) {
+      const kind = i === lines.length - 1 ? "truncated-tail" : "bad-json";
+      issues.push({ line: i + 1, kind, detail: String(err) });
+      continue;
+    }
+
+    const ts = entryTs(entry);
+    if (ts !== undefined) {
+      session.createdAt ??= ts;
+      session.updatedAt = ts;
+    }
+
+    if (entry.type === "session") {
+      if (session.cwd === "" && typeof entry.cwd === "string") {
+        session.cwd = entry.cwd;
+      } else if (session.cwd !== "") {
+        issues.push({ line: i + 1, kind: "duplicate-session-header", detail: "" });
+      }
+      if (typeof entry.id === "string") session.source.id = entry.id;
+      if (entry.version !== PI_SESSION_VERSION) {
+        issues.push({
+          line: i + 1,
+          kind: "unknown-session-version",
+          detail: String(entry.version),
+        });
+      }
+      continue;
+    }
+
+    // linear id/parentId chain — breaks are data quirks, not fatal
+    if (entry.parentId !== expectedParent) {
+      issues.push({
+        line: i + 1,
+        kind: "chain-break",
+        detail: `parentId ${String(entry.parentId)} != ${String(expectedParent)}`,
+      });
+    }
+    if (typeof entry.id === "string") expectedParent = entry.id;
+
+    if (entry.type !== "message") inResultBatch = false;
+    switch (entry.type) {
+      case "model_change":
+        currentModel = {
+          provider: typeof entry.provider === "string" ? entry.provider : undefined,
+          id: typeof entry.modelId === "string" ? entry.modelId : undefined,
+        };
+        break;
+      case "session_info":
+        if (typeof entry.name === "string") session.title ??= entry.name;
+        pushPiExtension(session, "session_info", entry);
+        break;
+      case "compaction": {
+        const meta: Record<string, unknown> = {};
+        for (const key of ["firstKeptEntryId", "tokensBefore", "details", "fromHook"]) {
+          if (entry[key] !== undefined) meta[key] = entry[key];
+        }
+        session.messages.push({
+          id: newId(),
+          role: "user",
+          parts: [
+            {
+              type: "compaction",
+              summary: typeof entry.summary === "string" ? entry.summary : "",
+              ...(Object.keys(meta).length > 0 && { meta }),
+            },
+          ],
+          ...(ts !== undefined && { timestamp: ts }),
+          sourceIds: typeof entry.id === "string" ? [entry.id] : [],
+        });
+        break;
+      }
+      case "message":
+        inResultBatch = ingestPiMessage(
+          entry,
+          session,
+          currentModel,
+          inResultBatch,
+          ts,
+          issues,
+          i + 1,
+        );
+        break;
+      case "thinking_level_change":
+      case "custom":
+      case "custom_message":
+        pushPiExtension(session, String(entry.type), entry);
+        break;
+      default:
+        issues.push({ line: i + 1, kind: "unknown-entry", detail: String(entry.type) });
+        pushPiExtension(session, `record:${String(entry.type)}`, entry);
+    }
+  }
+
+  await readPiChildren(path, session, issues);
+  await restoreSidecar(path, session, issues);
+  return session;
+}
+
+function pushPiExtension(session: IRSession, extType: string, payload: unknown): void {
+  session.extensions.push({
+    harness: "pi",
+    extType,
+    position: session.messages.length,
+    payload,
+  });
+}
+
+function entryTs(entry: Rec): number | undefined {
+  const message = entry.message as Rec | undefined;
+  if (typeof message?.timestamp === "number") return message.timestamp;
+  if (typeof entry.timestamp === "string") {
+    const parsed = Date.parse(entry.timestamp);
+    if (!Number.isNaN(parsed)) return parsed;
+  }
+  return undefined;
+}
+
+/** returns whether the message extended/produced a toolResult batch */
+function ingestPiMessage(
+  entry: Rec,
+  session: IRSession,
+  currentModel: { provider?: string; id?: string } | undefined,
+  inResultBatch: boolean,
+  ts: number | undefined,
+  issues: ReadIssue[],
+  line: number,
+): boolean {
+  const message = entry.message as Rec | undefined;
+  if (message === undefined) {
+    issues.push({ line, kind: "message-no-payload", detail: "" });
+    pushPiExtension(session, "record:message", entry);
+    return false;
+  }
+  const sourceIds = typeof entry.id === "string" ? [entry.id] : [];
+
+  switch (message.role) {
+    case "user": {
+      const parts: IRPart[] = [];
+      for (const block of blocksOf(message.content)) {
+        if (block.type === "text") {
+          parts.push({ type: "text", text: String(block.text ?? "") });
+        } else {
+          issues.push({ line, kind: "unknown-user-block", detail: String(block.type) });
+          parts.push({ type: "extension", harness: "pi", extType: `block:${String(block.type)}`, payload: block });
+        }
+      }
+      session.messages.push({
+        id: newId(),
+        role: "user",
+        parts,
+        sourceIds,
+        ...(ts !== undefined && { timestamp: ts }),
+      });
+      return false;
+    }
+    case "assistant": {
+      const parts: IRPart[] = [];
+      for (const block of blocksOf(message.content)) {
+        switch (block.type) {
+          case "text":
+            parts.push({ type: "text", text: String(block.text ?? "") });
+            break;
+          case "thinking": {
+            const signature = String(block.thinkingSignature ?? "");
+            parts.push({
+              type: "thinking",
+              text: String(block.thinking ?? ""),
+              ...(signature !== "" && {
+                signature: {
+                  provider: signatureProvider(message.api, message.provider),
+                  data: signature,
+                },
+              }),
+            });
+            break;
+          }
+          case "toolCall":
+            parts.push({
+              type: "toolCall",
+              callId: String(block.id ?? ""),
+              name: String(block.name ?? ""),
+              input: block.arguments,
+            });
+            break;
+          default:
+            issues.push({ line, kind: "unknown-assistant-block", detail: String(block.type) });
+            parts.push({ type: "extension", harness: "pi", extType: `block:${String(block.type)}`, payload: block });
+        }
+      }
+      const meta: Record<string, unknown> = {};
+      for (const key of ["stopReason", "errorMessage", "api", "responseId", "diagnostics"]) {
+        if (message[key] !== undefined) meta[key] = message[key];
+      }
+      const provider =
+        typeof message.provider === "string" ? message.provider : currentModel?.provider;
+      const modelId = typeof message.model === "string" ? message.model : currentModel?.id;
+      session.messages.push({
+        id: newId(),
+        role: "assistant",
+        parts,
+        sourceIds,
+        ...(ts !== undefined && { timestamp: ts }),
+        ...((provider !== undefined || modelId !== undefined) && {
+          model: { provider, id: modelId },
+        }),
+        ...(isRecord(message.usage) && { usage: usageOf(message.usage) }),
+        ...(Object.keys(meta).length > 0 && { meta }),
+      });
+      return false;
+    }
+    case "toolResult": {
+      const texts: string[] = [];
+      const rich: IRImagePart[] = [];
+      for (const block of blocksOf(message.content)) {
+        if (block.type === "text") texts.push(String(block.text ?? ""));
+        else if (block.type === "image") {
+          rich.push({
+            type: "image",
+            mediaType: String(block.mimeType ?? block.mediaType ?? "application/octet-stream"),
+            data: String(block.data ?? ""),
+          });
+        } else {
+          issues.push({ line, kind: "unknown-result-block", detail: String(block.type) });
+        }
+      }
+      const part: IRToolResultPart = {
+        type: "toolResult",
+        callId: String(message.toolCallId ?? ""),
+        name: typeof message.toolName === "string" ? message.toolName : undefined,
+        text: texts.join("\n"),
+        isError: message.isError === true,
+        ...(rich.length > 0 && { rich }),
+        ...(isRecord(message.details) && { structured: message.details }),
+      };
+      const last = session.messages.at(-1);
+      if (inResultBatch && last !== undefined && last.role === "user") {
+        last.parts.push(part);
+        if (sourceIds.length > 0) last.sourceIds!.push(sourceIds[0]!);
+      } else {
+        session.messages.push({
+          id: newId(),
+          role: "user",
+          parts: [part],
+          sourceIds,
+          ...(ts !== undefined && { timestamp: ts }),
+        });
+      }
+      return true;
+    }
+    case "bashExecution":
+      // pi-only role: a raw `!command` the user ran — positional, pi-specific
+      session.messages.push({
+        id: newId(),
+        role: "user",
+        parts: [
+          { type: "extension", harness: "pi", extType: "bashExecution", payload: message },
+        ],
+        sourceIds,
+        ...(ts !== undefined && { timestamp: ts }),
+      });
+      return false;
+    default:
+      issues.push({ line, kind: "unknown-role", detail: String(message.role) });
+      pushPiExtension(session, `role:${String(message.role)}`, entry);
+      return false;
+  }
+}
+
+function blocksOf(content: unknown): Rec[] {
+  return Array.isArray(content) ? (content as Rec[]) : [];
+}
+
+function usageOf(usage: Rec) {
+  const num = (v: unknown) => (typeof v === "number" ? v : undefined);
+  const cost = usage.cost as Rec | undefined;
+  return {
+    inputTokens: num(usage.input),
+    outputTokens: num(usage.output),
+    reasoningTokens: num(usage.reasoning),
+    cacheReadTokens: num(usage.cacheRead),
+    cacheWriteTokens: num(usage.cacheWrite),
+    costUsd: num(cost?.total),
+  };
+}
+
+function signatureProvider(api: unknown, provider: unknown): string {
+  const a = String(api ?? "");
+  if (a.includes("anthropic")) return "anthropic";
+  if (a.includes("openai") || a.includes("codex")) return "openai";
+  return typeof provider === "string" ? provider : "unknown";
+}
+
+async function readPiChildren(
+  path: string,
+  session: IRSession,
+  issues: ReadIssue[],
+): Promise<void> {
+  const root = path.endsWith("session.jsonl")
+    ? dirname(path)
+    : path.replace(/\.jsonl$/, "");
+  const entries = await readdir(root).catch(() => null);
+  if (entries === null) return;
+  for (const entry of entries.sort()) {
+    if (!/^[0-9a-f]{8}$/.test(entry)) continue;
+    const runs = await readdir(join(root, entry)).catch(() => [] as string[]);
+    for (const run of runs.sort()) {
+      if (!/^run-\d+$/.test(run)) continue;
+      const childPath = join(root, entry, run, "session.jsonl");
+      if (!(await Bun.file(childPath).exists())) continue;
+      const child = await parsePiSession(childPath, issues);
+      const ref: IRChildSession = { session: child };
+      // session_info name carries what the writer knew: a description, or
+      // the marker form `subagent-<type>`
+      if (child.title !== undefined) {
+        if (child.title.startsWith("subagent-")) {
+          ref.agentType = child.title.slice("subagent-".length);
+        } else {
+          ref.description = child.title;
+        }
+      }
+      session.children.push(ref);
+    }
+  }
+  // sidecar dir names are random 8-hex — recover a stable order
+  session.children.sort(
+    (a, b) => (a.session.createdAt ?? 0) - (b.session.createdAt ?? 0),
+  );
+}
+
+async function restoreSidecar(
+  path: string,
+  session: IRSession,
+  issues: ReadIssue[],
+): Promise<void> {
+  if (path.endsWith("session.jsonl")) return; // children have no sidecar
+  const file = Bun.file(path.replace(/\.jsonl$/, ".chagent.json"));
+  if (!(await file.exists())) return;
+  try {
+    const data = await file.json();
+    if (data?.chagent === 1 && Array.isArray(data.extensions)) {
+      for (const ext of data.extensions) {
+        session.extensions.push({
+          ...ext,
+          position: Math.min(Number(ext.position ?? 0), session.messages.length),
+        });
+      }
+      const src = data.source ?? {};
+      issues.push({
+        line: 0,
+        kind: "chagent-sidecar",
+        detail: `restored ${data.extensions.length} extensions; original source ${String(src.harness)}:${String(src.id)}`,
+      });
+    }
+  } catch (err) {
+    issues.push({ line: 0, kind: "bad-sidecar", detail: String(err) });
+  }
 }

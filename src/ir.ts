@@ -171,6 +171,28 @@ export interface IRExtension {
   payload: unknown;
 }
 
+/** a discoverable session in some harness's store */
+export interface SessionRef {
+  harness: Harness;
+  /** native session id */
+  id: string;
+  /** how the adapter re-finds it: a file path, or `<dbPath>::<id>` for dbs */
+  locator: string;
+  cwd?: string;
+  updatedAt?: number;
+}
+
+export interface ReadIssue {
+  line: number;
+  kind: string;
+  detail: string;
+}
+
+export interface ReadResult {
+  session: IRSession;
+  issues: ReadIssue[];
+}
+
 export function newId(): string {
   return crypto.randomUUID();
 }

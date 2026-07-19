@@ -24,7 +24,9 @@ usage:
 
 session ids:
   a full session id, a unique prefix (git-style), or a qualified form
-  like claude:6071d393. an ambiguous prefix fails and lists candidates.
+  like claude:6071d393 or pi:019f60bb. bare ids are searched across
+  every harness (claude, pi, opencode, codex); an ambiguous prefix
+  fails and lists the qualified candidates.
 
 targets:
   pi          writes into ~/.pi/agent/sessions

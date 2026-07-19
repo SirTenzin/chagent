@@ -15,6 +15,8 @@ import { basename, dirname, join } from "node:path";
 import { readdir } from "node:fs/promises";
 import {
   newId,
+  type ReadIssue,
+  type ReadResult,
   type IRChildSession,
   type IRExtension,
   type IRImagePart,
@@ -49,16 +51,7 @@ const ENVELOPE_KEYS = [
 
 type Rec = Record<string, unknown>;
 
-export interface ReadIssue {
-  line: number;
-  kind: string;
-  detail: string;
-}
-
-export interface ReadResult {
-  session: IRSession;
-  issues: ReadIssue[];
-}
+export type { ReadIssue, ReadResult } from "../ir.ts";
 
 export function claudeProjectDir(cwd: string): string {
   // observed encoding: both "/" and "." become "-"; spaces survive

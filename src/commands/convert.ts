@@ -6,12 +6,9 @@
  * 2 unsupported target (usage error).
  */
 import { homedir } from "node:os";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { text } from "../text.ts";
-import {
-  listClaudeSessions,
-  readClaudeSession,
-} from "../adapters/claude-code.ts";
+import { resolveSession, readSession } from "../resolve.ts";
 import { writePiSession } from "../adapters/pi.ts";
 import { writeOpenCodeSession } from "../adapters/opencode.ts";
 import { writeCodexSession } from "../adapters/codex.ts";
@@ -32,26 +29,22 @@ export async function runConvert(
   }
 
   const started = performance.now();
-  const id = idArg.startsWith("claude:")
-    ? idArg.slice("claude:".length)
-    : idArg;
-  const all = await listClaudeSessions(`${homedir()}/.claude`);
-  const matches = all.filter((f) => basename(f, ".jsonl").startsWith(id));
-  if (matches.length === 0) {
-    console.error(text.noMatch(idArg));
-    return 1;
-  }
-  if (matches.length > 1) {
-    console.error(text.ambiguous(idArg));
-    for (const m of matches) {
-      console.error(text.ambiguousCandidate(`claude:${basename(m, ".jsonl")}`));
+  const resolved = await resolveSession(idArg);
+  if (!resolved.ok) {
+    if (resolved.kind === "none") {
+      console.error(text.noMatch(idArg));
+    } else {
+      console.error(text.ambiguous(idArg));
+      for (const c of resolved.candidates) {
+        console.error(text.ambiguousCandidate(`${c.harness}:${c.id}`));
+      }
     }
     return 1;
   }
 
-  const file = matches[0]!;
-  console.log(text.loading(`claude:${basename(file, ".jsonl")}`));
-  const { session, issues } = await readClaudeSession(file);
+  const ref = resolved.ref;
+  console.log(text.loading(`${ref.harness}:${ref.id}`));
+  const { session, issues } = await readSession(ref);
   console.log(
     text.loaded(
       session.messages.length,

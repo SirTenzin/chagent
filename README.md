@@ -1,7 +1,9 @@
 # chagent
 
 `chsh` for coding agents: move a session from one agent CLI to another and keep
-working. Reads Claude Code sessions; writes Pi, OpenCode, and Codex.
+working. Reads Claude Code, Pi, OpenCode, and Codex sessions; writes Pi,
+OpenCode, and Codex. Session ids resolve automatically across every harness —
+`chagent 019f7b73 codex` finds the session wherever it lives.
 
 ## install
 
@@ -31,7 +33,7 @@ The last line is always the command that resumes the converted session.
 
 | | claude code | pi | opencode | codex |
 |---|---|---|---|---|
-| direction | read | write | write | write |
+| direction | read | read + write | read + write | read + write |
 | text, images, attachments | ✓ | ✓ | ✓ | ✓ |
 | shell / edit / write tool calls | ✓ | ✓ | ✓ | ✓ native |
 | other tool calls | ✓ | ✓ | ✓ | passthrough¹ |
