@@ -4,7 +4,9 @@
  * exit codes are decided by callers, never here. Catalog: COMPAT.md §7.
  */
 
-export const VERSION = "0.0.1";
+import pkg from "../package.json";
+
+export const VERSION: string = pkg.version;
 
 export const text = {
   // ---- banner / meta -------------------------------------------------------
@@ -29,6 +31,7 @@ session ids:
   fails and lists the qualified candidates.
 
 targets:
+  claude      writes into ~/.claude/projects
   pi          writes into ~/.pi/agent/sessions
   opencode    writes into ~/.local/share/opencode/opencode.db
   codex       writes into ~/.codex/sessions (+ resume index)
@@ -71,7 +74,7 @@ the last line is always the command that resumes the converted session.`,
   ambiguousCandidate: (qualifiedId: string) => `  ${qualifiedId}`,
   noMatch: (id: string) => `no session matching ${id}`,
   unsupportedTarget: (target: string) =>
-    `unsupported target: ${target} (targets: pi, opencode, codex)`,
+    `unsupported target: ${target} (targets: claude, pi, opencode, codex)`,
   writeError: (message: string) => `error: ${message}`,
 
   // ---- convert: non-fatal notes (stderr, exit stays 0) ---------------------
@@ -90,6 +93,7 @@ the last line is always the command that resumes the converted session.`,
     `${path} is missing opencode tables — refusing to write`,
 
   // ---- resume hints (final stdout line, after a blank line) ----------------
+  resumeClaude: (id: string) => `claude -r ${id}`,
   resumePi: (id: string) => `pi --session ${id}`,
   resumeOpencode: (id: string) => `opencode -s ${id}`,
   resumeCodex: (idOrPath: string) => `codex resume ${idOrPath}`,

@@ -209,7 +209,11 @@ function writeSession(
     providerID: "anthropic",
     modelID: "unknown",
   };
-  let prevMsgId: string | null = null;
+  // OpenCode groups every assistant step in a turn under the user message
+  // that started it. The UI rejects an assistant whose parentID resolves to
+  // another assistant (and drops the whole loaded page), so never chain
+  // assistant → assistant here.
+  let currentUserId: string | null = null;
   let lastAssistantId: string | null = null;
 
   for (const message of ir.messages) {
@@ -228,12 +232,37 @@ function writeSession(
       totals.cacheWrite += usage?.cacheWriteTokens ?? 0;
       totals.cost += usage?.costUsd ?? 0;
 
+      // Subagent transcripts can begin with an assistant continuation because
+      // the parent context is inherited out-of-band. OpenCode nevertheless
+      // requires every assistant parent to be a user row. Add an invisible
+      // (part-less) user anchor rather than inventing visible transcript text.
+      if (currentUserId === null) {
+        const anchorId = ids.next("msg", ts);
+        insertMessage.run(
+          anchorId,
+          sesId,
+          ids.ms,
+          ids.ms,
+          JSON.stringify({
+            role: "user",
+            time: { created: ts },
+            agent: "build",
+            model: {
+              providerID: lastModel.providerID,
+              modelID: lastModel.modelID,
+            },
+            synthetic: true,
+          }),
+        );
+        currentUserId = anchorId;
+      }
+
       const msgId = ids.next("msg", ts);
       lastAssistantId = msgId;
       const parts = assistantParts(message, results, consumed, childIdByCall, ts, msgId);
       const hasTool = parts.some((p) => (p as { type?: string }).type === "tool");
       const data = {
-        parentID: prevMsgId,
+        parentID: currentUserId,
         role: "assistant",
         mode: "build",
         agent: "build",
@@ -262,7 +291,6 @@ function writeSession(
         const partId = ids.next("prt", ts);
         insertPart.run(partId, msgId, sesId, ids.ms, ids.ms, JSON.stringify(part));
       }
-      prevMsgId = msgId;
     } else {
       // results are folded into assistant tool parts; a user message that
       // carried only results produces no OpenCode message at all
@@ -281,7 +309,7 @@ function writeSession(
         const partId = ids.next("prt", ts);
         insertPart.run(partId, msgId, sesId, ids.ms, ids.ms, JSON.stringify(part));
       }
-      prevMsgId = msgId;
+      currentUserId = msgId;
     }
   }
 

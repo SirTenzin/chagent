@@ -9,12 +9,13 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { text } from "../text.ts";
 import { resolveSession, readSession } from "../resolve.ts";
+import { writeClaudeSession } from "../adapters/claude-code.ts";
 import { writePiSession } from "../adapters/pi.ts";
 import { writeOpenCodeSession } from "../adapters/opencode.ts";
 import { writeCodexSession } from "../adapters/codex.ts";
 import type { IRSession } from "../ir.ts";
 
-const TARGETS = ["pi", "opencode", "codex"] as const;
+const TARGETS = ["claude", "pi", "opencode", "codex"] as const;
 type Target = (typeof TARGETS)[number];
 
 export async function runConvert(
@@ -88,6 +89,8 @@ function write(
   home: string | undefined,
 ): Promise<Written> {
   switch (target) {
+    case "claude":
+      return writeClaudeSession(ir, home ?? join(homedir(), ".claude"));
     case "pi":
       return writePiSession(ir, home ?? join(homedir(), ".pi/agent"));
     case "opencode":
