@@ -2,13 +2,13 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { IRPart, IRSession } from "../ir.ts";
+import type { IRPart, IRSession } from "../src/ir.ts";
 import {
   claudeProjectDir,
   readClaudeSession,
   writeClaudeSession,
-} from "./claude-code.ts";
-import { readPiSession, writePiSession } from "./pi.ts";
+} from "../src/adapters/claude-code.ts";
+import { readPiSession, writePiSession } from "../src/adapters/pi.ts";
 
 const scratch: string[] = [];
 
