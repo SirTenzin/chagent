@@ -1,6 +1,6 @@
 {
   "name": "chagent",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "chsh for coding agents — move sessions between Claude Code, Pi, OpenCode, and Codex",
   "module": "index.ts",
   "type": "module",
